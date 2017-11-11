@@ -9,7 +9,7 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
 #include "spline.h"
-#include "state.h"
+//#include "state.h"
 
 using namespace std;
 
@@ -171,7 +171,7 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 }
 
 bool close(vector<vector<double>> sensor_fusion, double s,double d, double speed)
-{
+{// returns a flag is there is a car in front
 	bool too_close  =false;
 	const bool verbose 	= true;		//debug
 	const double delta_t = 0.25;    //future time
@@ -189,7 +189,7 @@ bool close(vector<vector<double>> sensor_fusion, double s,double d, double speed
           	oc_s  += (delta_t * oc_speed);      //other car's position in 0.2 seconds
           	double mc_s = s + (delta_t * speed);
           	double gap = oc_s - mc_s;
-          	if ( (gap < close_distance) && (gap>0) && (oc_speed -1 < speed) )
+          	if ( (gap < close_distance) && (gap>0) && (oc_speed -2 < speed) )
           	{// too close
           		// three conditions (1) car is close, (2) car is front, (3) car is slower or close velocity
           		too_close = true;
@@ -199,7 +199,7 @@ bool close(vector<vector<double>> sensor_fusion, double s,double d, double speed
         }//detected car in same lane
     }//for each car
 	return(too_close);
-}
+}// returns a flag is there is a car in front
 
 
 int main()
@@ -209,8 +209,8 @@ int main()
   static const double delta_t           = 0.02;         //sampling interval seconds
   static const double mps2mph 			= 2.23694;		//meters-per-seconds to mile-per-hour
   static const double max_speed    		= 49.5/mps2mph; //max car speed meters per second
+  static const double max_speed_thr     = 45/mps2mph;   // if less than this number switch lanes
   static const double max_acc           = 9.5;			// max acceleration meters per second^2
-  static const double delta_v           = max_acc * delta_t; // change in velocity
   static const double lane_width 		= 4;            //in meters
   static const unsigned int N    		= 50;           //trajectory points
   static const unsigned int N_sparse    = 3;            //sparse trajectory points
@@ -219,15 +219,14 @@ int main()
   static const bool verbose             = false;
   static const bool verbose_others      = true;
 
-  // define and initialize main car desired speed and lane number
-  static unsigned int mc_desired_lane = 1;
-  static double mc_desired_speed      = 0;         //car speed in mph
+  static const double delta_v  = max_acc * delta_t; // change in velocity in one sample
+  static unsigned int mc_lane = 1;					//main car lane
+  static double mc_desired_speed=0;         //car speed in mph
+  static double mc_d_pos;				// main car d displacement
+  static bool mode_lc 	= false;        //0==>KL, 1==>LC
 
-  static double delta_s;
-  static double mc_d_pos;
-
-  static State state;
-  state.set_initial_par(mc_desired_speed, mc_desired_lane);
+//  static State state;
+//  state.set_initial_par(mc_desired_speed, mc_lane);
 
   // Waypoint map to read from
   // Load up map values for waypoint's x,y,s and d normalized normal vectors
@@ -288,17 +287,18 @@ int main()
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];        // degrees
-          	double mc_speed = j[1]["speed"];
-          	mc_speed /= mps2mph;
-          	state.update_main_car_state(car_x, car_y, mc_speed);
+          	double mc_speed = j[1]["speed"];	 // main car - mph
+          	mc_speed /= mps2mph;                 // metric units used throughput
+          	//cout << "speed=" << mc_speed << ", s=" << car_s << endl;
+          	//state.update_main_car_state(car_x, car_y, mc_speed);
           	if(verbose)
           	{
           		cout << "loc: (x,y)=(" << car_x << "," << car_y << "), (s,d)=(" << car_s << "," << car_d
           			 << "), yaw=" << car_yaw << " v=" << mc_speed << endl;
           	}
           	// Previous path data given to the Planner (N - processed data)
-          	auto previous_path_x = j[1]["previous_path_x"];      	//map coordinates
-          	auto previous_path_y = j[1]["previous_path_y"];			//map coordinates
+          	vector<double> previous_path_x = j[1]["previous_path_x"];      	//map coordinates
+          	vector<double> previous_path_y = j[1]["previous_path_y"];			//map coordinates
           	// Previous path's end s and d values 
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
@@ -307,25 +307,16 @@ int main()
 
           	// NEW CODE: find trajectory (next_*_vals) in MAP (X,Y) COORDINATES
           	//-----------------------------------------------------------------
-          	// prev_size = N - processed samples by car in a single interval
-          	int prev_size = previous_path_x.size();
 
-          	// Check other cars
-          	//bool too_close = false;
-        	double mc_s_pos = car_s;
-        	mc_d_pos	= (mc_desired_lane + 0.5)*lane_width; // desired displacement in m in (s,d) coordinates
-        	if(verbose)
-        	{
-        			cout << "desired lane pos="   << mc_s_pos << " m" << endl;
-        	}
-
-        	bool too_close = close(sensor_fusion, mc_s_pos, mc_d_pos, mc_speed);
-        	//mc_desired_lane = 0;
-        	//mc_d_pos	= (mc_desired_lane + 0.5)*lane_width;
-
+          	// check if there is a car in front
+         	mc_d_pos	= (mc_lane + 0.5)*lane_width;
+          	bool too_close = close(sensor_fusion, car_s, mc_d_pos, mc_speed);
           	if (too_close)
           	{
-          		mc_desired_speed -= delta_v;
+          		//if (mc_speed > max_speed_thr)
+          			mc_desired_speed -= delta_v;
+          		//else
+          			//mode_lc = 1;
           	}
           	else
           	{
@@ -333,17 +324,19 @@ int main()
           	    if(mc_desired_speed > max_speed)
           	    	mc_desired_speed = max_speed;
           	}
-          	delta_s = delta_t *mc_desired_speed;       // incremental distance for trajectory
 
-        	if(verbose)
-        	{
-        		cout << "distance increment=" << delta_s << " m" << endl;
-        	}
+          	// lane change here
+          	//mc_lane = 0;
+          	//mc_d_pos	= (mc_lane + 0.5)*lane_width;
 
-
+          	// the goal is to determine next_*_val
+          	//-------------------------------------
             vector<double> next_x_vals;
             vector<double> next_y_vals;
+
             // (A) use previous path points as much as possible
+         	// prev_size = (N - processed samples by car in a single interval)
+            int prev_size = previous_path_x.size();
             for(unsigned int i=0; i<prev_size; i++)
             {
             	next_x_vals.push_back(previous_path_x[i]);
@@ -355,41 +348,48 @@ int main()
             	cout << ", current trajectory size = (" << next_x_vals.size() << ", " << next_y_vals.size() << ")" << endl;
             }
 
-            // Initialization
             if (prev_size < 2)
-            {
-            	for(unsigned int i = 0; i < N-prev_size; i++)
+            {// initialization
+            	double _t;				// time
+            	double _s;				// s-axis
+            	double _d = mc_d_pos;   // d-axis
+            	for(unsigned int i = 0; i < N; i++)
                 {
-                 	double next_s = car_s + double(i+prev_size+1)*delta_s;
-                 	double next_d = mc_d_pos;
+            		_t = double(i)*delta_t;
+            		_s = car_s + 0.5*max_acc*_t*_t;
                  	// (s,d) --> (x,y)
-                 	vector<double> xy = getXY(next_s,next_d,map_waypoints_s, map_waypoints_x, map_waypoints_y);
+                 	vector<double> xy = getXY(_s,_d,map_waypoints_s, map_waypoints_x, map_waypoints_y);
                  	next_x_vals.push_back(xy[0]);
                  	next_y_vals.push_back(xy[1]);
-                 	cout << "(s,d)=(" << next_s << "," << next_d << "),  (x,y)=" << xy[0] << "," << xy[1] << ")" << endl;
+                 	if(verbose)
+                 		cout << "s=" << _s << endl;
                  }
-                 cout << endl;
-            }
+            	mc_desired_speed = double(N-1)*delta_t*max_acc; // at the end of trajectory
+                cout << "initialized" << endl;
+            }// initialization
             else
             {// normal operation
-            	//(B) spline interpolation in xy-car coordinates
-            	tk::spline s;
-            	double ref_x;  	// car coordinates on map
-            	double ref_y;  	// car coordinates on map
-            	double ref_yaw; // car yaw
+            	// (A)construct the spline interpolator
+            	// (B)construct trajectory
+
+                //starting point is the last previous point
+            	double ref_x = previous_path_x[prev_size-1];  	// car coordinates on map
+            	double ref_y = previous_path_y[prev_size-1];  	// car coordinates on map
+            	double ref_yaw; 								// car yaw on map
+
+            	//spline interpolation in xy-car coordinates
+                tk::spline s;
             	{//set spline
-            		// for the rest of the points need to smooth out trajectory, or minimize sudden changes:
-            		// by using (a) sparsely spaced  way-points and then (2) spline interpolate
+            		// step (1): sparsely spaced  way-points and then
+            		// step (2): spline interpolation
+
             		vector<double> ptsx;	// sparsely spaced way-points
             		vector<double> ptsy;    // sparsely spaced way-points
 
             		// reference point (first 2 points in ptsx/y)
             		double ref_x_prev;
             		double ref_y_prev;
-
             		{// there is previous path use last 2 points
-            			ref_x = previous_path_x[prev_size-1];
-            			ref_y = previous_path_y[prev_size-1];
             			ref_x_prev = previous_path_x[prev_size-2];
             			ref_y_prev = previous_path_y[prev_size-2];
             			ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
@@ -400,13 +400,12 @@ int main()
             		ptsy.push_back(ref_y_prev);
             		ptsy.push_back(ref_y);
 
-            		// load additional points
-            		double next_d = mc_d_pos;
+            		// load additional points, in XY-coordinates
             		for(unsigned int i = 0; i < N_sparse; i++)
             		{
             			double next_s = car_s + double(i+1)*delta_s_sparse;
             			// (s,d) --> (x,y)
-            			vector<double> xy = getXY(next_s,next_d,map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            			vector<double> xy = getXY(next_s,mc_d_pos,map_waypoints_s, map_waypoints_x, map_waypoints_y);
             			ptsx.push_back(xy[0]);
             			ptsy.push_back(xy[1]);
             		}
@@ -422,7 +421,7 @@ int main()
             			cout << endl;
             		}
 
-            		// (x,y) map coordinates --> (x,y) car coordinates
+            		// XY map coordinates --> XY car coordinates
             		for(unsigned int i = 0; i < ptsx.size(); i++)
             		{//map coordinates --> car coordinates
             			double shift_x = ptsx[i] - ref_x;
@@ -449,21 +448,25 @@ int main()
 
             	//(C) populate needed trajectory points using spline interpolation
             	// set boundary target distance using target_x
-            	double target_y    = s(target_x);
-            	double target_dist = sqrt(target_x*target_x + target_y*target_y);
-            	double samples     = target_dist/delta_s;
-            	double inc_x       = target_x/samples;
-            	if(verbose)
-            	{
-            		cout << "target in xy-car coordinates: y=" << target_y << ", dis=" << target_dist;
-            		cout << ", samples= " << samples << ", inc_x= " << inc_x << endl << endl;
-            		cout << "new trajectory points in xy car and map coordinates" << endl;
-            	}
+            	double delta_s     = delta_t * mc_desired_speed;       // incremental distance for trajectory
+            	//double target_y    = s(target_x);
+            	//double target_dist = sqrt(target_x*target_x + target_y*target_y);
+            	//double samples     = target_dist/delta_s;
+            	//double inc_x       = target_x/samples;
+            	//cout <<  "inc_x- inc_s = " << inc_x - delta_s << endl;
+            	//if(verbose)
+            	//{
+            	//	cout << "distance increment=" << delta_s << " m" << endl;
+            	//	cout << "target in xy-car coordinates: y=" << target_y << ", dis=" << target_dist;
+            	//	cout << ", samples= " << samples << ", inc_x= " << inc_x << endl << endl;
+            	//	cout << "new trajectory points in xy car and map coordinates" << endl;
+            	//}
 
             	double x_car_coor = 0.0;
             	for(unsigned int i = 0; i < N-prev_size; i++)
             	{
-            		x_car_coor += inc_x;
+            		//x_car_coor += inc_x;
+            		x_car_coor += delta_s;
             		double y_car_coor = s(x_car_coor);
             		// car coordinates to map coordinates
             		double x_map = x_car_coor*cos(ref_yaw) - y_car_coor*sin(ref_yaw) + ref_x;

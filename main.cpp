@@ -13,7 +13,8 @@
 
 using namespace std;
 
-const double mps2mph 			= 2.23694;		//meters-per-seconds to mile-per-hour
+const double mps2mph 		= 2.23694;	//meters-per-seconds to mile-per-hour
+const double min_gap 		= 25;   	// threshold on longitudinal distance between cars
 
 // for convenience
 using json = nlohmann::json;
@@ -177,12 +178,11 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 bool car_in_front(vector<vector<double>> sensor_fusion, double s, double d, double mc_speed)
 {// returns a flag is there is a car in front
 	bool too_close  =false;
-	const bool verbose 		 = true;	//for debug
+	const bool verbose 		 = false;	//for debug
 
 	const double delta_d_max 	= 1.5; 	// if within this displacement ==> in same lane
 	const double delta_t 		= 1; // future time horizon
 	const double delta_v        = 1;    // if car in front faster do not worry
-	const double min_gap 		= 25;   // threshold on longitudinal distance
 
     double mc_s = s + (delta_t * mc_speed); 	// main car position on time horizon
 	unsigned int i = 0;
@@ -240,7 +240,7 @@ bool check_lane(vector<vector<double>> sensor_fusion, double s,double d, double 
           	double future_gap = oc_s - mc_s;
 
           	// conditions for n=lane NOT being available
-          	bool cond1 = (current_gap < distance_front) && (current_gap>distance_back); //other car in the way now
+          	bool cond1 = (current_gap < min_gap) && (current_gap>distance_back); //other car in the way now
           	bool cond2 = (future_gap < distance_front) && (future_gap>distance_back);   //other car in the way in future
           	if (cond1 || cond2)
           	{//lane not available
@@ -306,14 +306,14 @@ int main()
   static unsigned int freeze_count 		= 0;			//freeze decisions after LC
 
   // parameters
-  static const double max_speed    		= 48/mps2mph; 	//max car speed meters per second
+  static const double max_speed    		= 48.5/mps2mph; //max car speed meters per second
   static const double max_acc           = 8;			//max acceleration meters per second^2
   static const double delta_v  			= max_acc * delta_t; // change in velocity in one sample
   static const unsigned int freeze_set  = 30;
 
   static const unsigned int N    		= 60;           //default number of trajectory points
   static const int N_sparse             = 3;            //sparse trajectory points after start
-  static const double delta_s_sparse    = 25;    		//(m), incremental distance for sparse spline
+  static const double delta_s_sparse    = 30;    		//(m), incremental distance for sparse spline
 
   //debug
   static const bool verbose             = false;
@@ -399,9 +399,10 @@ int main()
           	// NEW CODE: find trajectory (next_*_vals) in MAP (X,Y) COORDINATES
           	//-----------------------------------------------------------------
 
+
+          	// State machine that decides to switch lanes
          	if(freeze_count > 0)
          	{
-         		cout << "count = " << freeze_count << endl;
          		freeze_count --;
          	}
          	else
@@ -424,7 +425,7 @@ int main()
           					mode_lc = true;
           				    mc_lane = 0;
           				    mc_d_pos	= get_d(mc_lane,lane_width);
-          				    cout << "switch to lane 0: desired d=" << mc_d_pos << endl;
+          				    cout << "switch to lane 0" <<  endl;
           				}
           				else
           				{//check lane 2
@@ -434,9 +435,8 @@ int main()
           			        	mode_lc = true;
           			            mc_lane = 2;
           			            mc_d_pos	= get_d(mc_lane,lane_width);
-          			            cout << "switch to lane 2: desired d=" << mc_d_pos << endl;
+          			            cout << "switch to lane 2"  << endl;
           			        }
-          			        cout << "lane 0:2 OK" <<  lane_0_ok << ":" << lane_2_ok << endl;
           				}
           			}// current lane is 1
           			else
@@ -466,101 +466,87 @@ int main()
          	}//no freeze
 
 
-          	// the goal is to determine next_xy_vals
-          	//--------------------------------------
+          	// determine next_xy_vals
+          	//-----------------------
             vector<double> next_x_vals;
             vector<double> next_y_vals;
             {//Trajectory formation
             	// (A) use previous (remaining) path point
             	int samples_to_save = previous_path_x.size();
-
             	for(unsigned int i=0; i<samples_to_save; i++)
             	{
             		next_x_vals.push_back(previous_path_x[i]);
             		next_y_vals.push_back(previous_path_y[i]);
             	}
 
-            	if( (samples_to_save < N))              // || (mode_lc==true))
+            	if( (samples_to_save < N))
             	{//need update
-            		// (B) spline formation in XY-car coordinates
-            		// - step (1): sparsely spaced  way-points and then
-            		// - step (2): spline interpolation
-            		vector<double> ptsx;	// sparsely spaced way-points (step 1)
-            		vector<double> ptsy;    // sparsely spaced way-points (step 1)
+            		// (B) spline formation of trajectory in XY-car coordinates
+            		// - step (1): sparsely spaced  way-points to generate spline
+            		// - step (2): evaluate spline at N positions
+
+            		// step (1)
+            		// --------
+            		vector<double> ptsx;	// sparsely spaced way-points
+            		vector<double> ptsy;    // sparsely spaced way-points
+            		// reference point for spline in XY-MAP coordinates
             		double ref_x;
             		double ref_y;
             		double ref_yaw;
             		double ref_s;
             		double ref_d;
 
-            		// step 1.a generate first 2 points of ptsx/y (boundary)
+            		// generate first 2 points of ptsx/y (boundary)
             		if (samples_to_save < 2)
-            		{// initialization
-            			//starting point is car_x/car_y
+            		{//start
+            			//starting point is car_xy
             			ref_x = car_x;  					// car coordinates on map
             			ref_y = car_y;  					// car coordinates on map
             			ref_s = car_s;
             			ref_d = car_d;
             			ref_yaw = deg2rad(car_yaw); 		// car orientation on map
+
+            			// spline start
             			ptsx.push_back(ref_x-cos(ref_yaw)); // previous
             			ptsy.push_back(ref_y-sin(ref_yaw)); // previous
             			ptsx.push_back(ref_x);
             			ptsy.push_back(ref_y);
             			first_trajectory = true;
-            		}// initialization
+            		}//start
             		else
             		{// normal operation
-            			//starting point is the last previous point
+            			// for orientation
+            			double ref_x_prev = previous_path_x[samples_to_save-2];
+            			double ref_y_prev = previous_path_y[samples_to_save-2];
+
+            			//starting point is last previous point
             			ref_x = previous_path_x[samples_to_save-1];  	// car coordinates on map
             			ref_y = previous_path_y[samples_to_save-1];  	// car coordinates on map
             			ref_s = end_path_s;
             			ref_d = end_path_d;
-            			double ref_x_prev = previous_path_x[samples_to_save-2];
-            			double ref_y_prev = previous_path_y[samples_to_save-2];
             			ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+
+            			// spline start
             			ptsx.push_back(ref_x_prev);
             			ptsx.push_back(ref_x);
             			ptsy.push_back(ref_y_prev);
             			ptsy.push_back(ref_y);
             		}// normal operation
 
-            		// step 1.b generate additional N_sparse points
+            		// generate additional N_sparse points separated by distance delta_s_sparse
             		// load additional points, in XY-map coordinates
-            		double d_jump = mc_d_pos - ref_d;
+            		double d_jump = mc_d_pos - ref_d; //needed change in displacement (m)
             		double _d;
             		double _s;
+
             		for(unsigned int i = 0; i < N_sparse; i++)
-            		{
-            			if(mode_lc)
-            			{
-            				double t_norm = double(i+1)/double(N_sparse);
-            				double t_norm_3 = t_norm*t_norm*t_norm;
-            				double t_norm_4 = t_norm*t_norm_3;
-            				double t_norm_5 = t_norm*t_norm_4;
-            				_d = ref_d + d_jump*(10*t_norm_3 - 15*t_norm_4 + 6*t_norm_5);
-            			}
-            			else
-            			{
-            				_d = mc_d_pos;
-            			}
+            		{// for
+            			_d = mc_d_pos;
             			_s = ref_s + double(i+1)*delta_s_sparse;
-            			if (mode_lc)
-            				cout << "(" << _s << ", " << _d <<")" << endl;
             			vector<double> xy = getXY(_s,_d,map_waypoints_s, map_waypoints_x, map_waypoints_y); //map: (s,d) --> (x,y)
             			ptsx.push_back(xy[0]);
             			ptsy.push_back(xy[1]);
-            		}
-
-            		if (verbose)
-            		{
-            			cout << endl;
-            			cout << "sparse trajectory in XY-map coordinates:" << endl;
-            			for(unsigned int i = 0; i < ptsx.size(); i++)
-            			{
-            				cout << "(x,y)=(" << ptsx[i] << ", " << ptsy[i] << ")" << endl;
-            			}
-            			cout << endl;
-            		}
+            		}//for
 
             		// XY map coordinates --> XY car coordinates
             		for(unsigned int i = 0; i < ptsx.size(); i++)
@@ -568,29 +554,15 @@ int main()
             			XY_map2car(ptsx[i],ptsy[i],ref_x,ref_y,ref_yaw);
             		}
 
-            		if (verbose)
-            		{
-            			cout << "sparse trajectory in xy-car coordinates:" << endl;
-            			for(unsigned int i = 0; i < ptsx.size(); i++)
-            			{
-            				cout << "(" << ptsx[i] << ", " << ptsy[i] << ")" << endl;
-            			}
-            			cout << endl;
-            		}
-
             		tk::spline s;	//spline interpolation in xy-car coordinates
             		s.set_points(ptsx,ptsy);
+
             		{//step 2: populate needed trajectory points using spline interpolation
             			double delta_s     = delta_t * mc_desired_speed;       // incremental distance for trajectory
             			double _x = 0.0;
             			double _y;
-            			int ub = N-samples_to_save;
-            			//if (mode_lc)
-            			//{
-            			//	ub = int(t_lc/delta_t);
-            			//	cout << "upper bound set to " << ub << endl;
-            			//}
-            			for(unsigned int i = 0; i < ub; i++)
+
+            			for(unsigned int i = 0; i < N-samples_to_save; i++)
             			{//i
             				if(first_trajectory)
             				{// x = (1/2) a t^2
@@ -614,50 +586,11 @@ int main()
             				cout << "initialized" << endl;
             				first_trajectory = false;
             			}
-            		}//update
+            		}//step2
             		mode_lc = false;
                }//step 2
-               //cout << "speed=" << mc_speed << ", s=" << car_s << ", d="<< car_d << ", prev_size=" << prev_size << endl;
            }//KL
- /*
-           {//LC
-        	   int N_lc      = int(t_lc/delta_t); 				    // new trajectory of 3 seconds (4/0.02 = 200)
-        	   //double N_lc2 = N_lc/2.0;								// half way
-        	   double delta_s     = delta_t * mc_desired_speed;    // speed --> displacement: incremental distance for trajectory
-        	   //double omega       = 2.5*delta_t; 			       // sigmoid parameter
 
-        	   double d_jump      = mc_d_pos - car_d;
-        	   for(unsigned int i = 0; i < N_lc; i++)
-        	   {
-        		   double _s = car_s + double(i+1)*delta_s;
-        		   double t_norm = double(i)/double(N_lc);
-        		   double t_norm_3 = t_norm*t_norm*t_norm;
-        		   double t_norm_4 = t_norm*t_norm_3;
-        		   double t_norm_5 = t_norm*t_norm_4;
-        		   double _d = car_d + d_jump*(10*t_norm_3 - 15*t_norm_4 + 6*t_norm_5);
-        		   //double _d = car_d + d_jump/(1.0 + exp(-omega*(double(i)-N_lc2)));
-        		   cout << "(s, d)=(" << _s << ", " << _d << ")" << endl;
-        	       vector<double> xy = getXY(_s,_d,map_waypoints_s, map_waypoints_x, map_waypoints_y); //(s,d) --> (x,y)
-        	       next_x_vals.push_back(xy[0]);
-        	       next_y_vals.push_back(xy[1]);
-        	   }
-        	   mode_lc = false;
-            }//LC
- */
-
- /*
-         	for(unsigned int i = 0; i < N-prev_size; i++)
-         	{
-         		double next_s = car_s + double(i+prev_size+1)*delta_s;
-         		double next_d = mc_d_pos;
-         		// (s,d) --> (x,y)
-         		vector<double> xy = getXY(next_s,next_d,map_waypoints_s, map_waypoints_x, map_waypoints_y);
-         		next_x_vals.push_back(xy[0]);
-         		next_y_vals.push_back(xy[1]);
-         		cout << "(s,d)=(" << next_s << "," << next_d << "),  (x,y)=" << xy[0] << "," << xy[1] << ")" << endl;
-         	}
-         	cout << endl;
-*/
          	json msgJson;
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
